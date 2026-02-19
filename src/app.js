@@ -36,6 +36,7 @@ const {handleServerError} = require('./routeHandlers/handleError');
 const {shouldReturnHtml} = require('./utils/requestHelpers.js');
 const {generateLogDetail} = require('./utils/requestCompletionLogData.js');
 const {incrementRequestCount, decrementRequestCount, getRequestCount} = require('./utils/requestCounter');
+const {createOptionalTenantMiddleware, CORRELATION_ID_HEADER} = require('./multiTenancy/tenantMiddleware');
 
 /**
  * Creates the FHIR app
@@ -254,6 +255,21 @@ function createApp({fnGetContainer}) {
             next();
         }
     );
+
+    // Correlation ID middleware - extract or generate correlation ID for end-to-end tracing
+    app.use((req, res, next) => {
+        const correlationId = req.headers[CORRELATION_ID_HEADER] || generateUUID();
+        req.correlationId = correlationId;
+        httpContext.set('correlationId', correlationId);
+        res.setHeader('X-Correlation-ID', correlationId);
+        next();
+    });
+
+    // Multi-tenancy middleware (optional context - routes that need it will enforce)
+    if (isTrue(process.env.ENABLE_MULTI_TENANCY)) {
+        const tenantService = container.tenantService;
+        app.use(createOptionalTenantMiddleware({ tenantService }));
+    }
 
     // generate nonce, and add to httpContext
     app.use((req, res, next) => {

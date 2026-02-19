@@ -3,6 +3,12 @@
 const {SimpleContainer} = require('./utils/simpleContainer');
 const {AccessLogger} = require('./utils/accessLogger');
 const {ChangeEventProducer} = require('./utils/changeEventProducer');
+
+// Multi-Tenancy imports
+const {TenantService} = require('./multiTenancy/tenantService');
+const {TenantDatabaseManager} = require('./multiTenancy/tenantDatabaseManager');
+const {TenantConfigManager} = require('./multiTenancy/tenantConfigManager');
+const {CorrelationIdManager} = require('./tracing/correlationIdManager');
 const {ResourceManager} = require('./operations/common/resourceManager');
 const {DatabaseBulkInserter} = require('./dataLayer/databaseBulkInserter');
 const {DatabaseBulkLoader} = require('./dataLayer/databaseBulkLoader');
@@ -1019,6 +1025,22 @@ const createContainer = function () {
     container.register('redisManager', (c) => new RedisManager({
         redisClient: c.redisClient
     }));
+
+    // Multi-Tenancy services
+    container.register('tenantService', (c) => new TenantService({
+        mongoDatabaseManager: c.mongoDatabaseManager
+    }));
+
+    container.register('tenantDatabaseManager', (c) => new TenantDatabaseManager({
+        configManager: c.configManager
+    }));
+
+    container.register('tenantConfigManager', (c) => new TenantConfigManager({
+        configManager: c.configManager
+    }));
+
+    // Tracing / Correlation ID manager
+    container.register('correlationIdManager', () => new CorrelationIdManager());
 
     return container;
 };
