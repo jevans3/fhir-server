@@ -379,6 +379,163 @@ function createApp({fnGetContainer}) {
 
     app.use(adminRouter);
 
+    // --- Da Vinci Burden Reduction Routes (CDS Hooks, PAS, DTR, CDex) ---
+    // Only mounted when multi-tenancy is enabled
+    if (isTrue(process.env.ENABLE_MULTI_TENANCY)) {
+        // CDS Hooks 2.0 / CRD routes (discovery + hook invocation)
+        const cdsHooksRouter = container.cdsHooksRouter;
+        app.use(cdsHooksRouter.getRouter());
+
+        // Per-tenant SMART on FHIR configuration endpoint
+        const smartConfigurationEndpoint = container.smartConfigurationEndpoint;
+        app.get('/tenants/:tenantId/.well-known/smart-configuration', (req, res) => {
+            try {
+                const tenantContext = req.tenantContext;
+                const baseUrl = `${req.protocol}://${req.get('host')}`;
+                const config = smartConfigurationEndpoint.buildConfiguration({
+                    tenantId: req.params.tenantId,
+                    tenantContext: tenantContext || {},
+                    baseUrl
+                });
+                res.status(200).json(config);
+            } catch (err) {
+                res.status(500).json({
+                    resourceType: 'OperationOutcome',
+                    issue: [{ severity: 'error', code: 'exception', diagnostics: err.message }]
+                });
+            }
+        });
+
+        // PAS operations router (tenant-scoped)
+        const pasRouter = express.Router({ mergeParams: true });
+        pasRouter.use(express.json({ type: ['application/json', 'application/fhir+json'] }));
+
+        pasRouter.post('/tenants/:tenantId/4_0_0/Claim/\\$submit', async (req, res) => {
+            try {
+                const result = await container.pasSubmitOperation.submitAsync({
+                    tenantId: req.params.tenantId,
+                    requestBundle: req.body,
+                    requestInfo: {
+                        requestId: req.uniqueRequestId,
+                        userRequestId: req.id,
+                        headers: req.headers,
+                        user: req.authInfo?.context?.username || 'system',
+                        scope: req.authInfo?.scope
+                    }
+                });
+                res.status(200).json(result);
+            } catch (err) {
+                const statusCode = err.statusCode || 500;
+                res.status(statusCode).json({
+                    resourceType: 'OperationOutcome',
+                    issue: [{ severity: 'error', code: 'exception', diagnostics: err.message }]
+                });
+            }
+        });
+
+        pasRouter.post('/tenants/:tenantId/4_0_0/Claim/\\$inquire', async (req, res) => {
+            try {
+                const result = await container.pasInquireOperation.inquireAsync({
+                    tenantId: req.params.tenantId,
+                    inquiryBundle: req.body,
+                    requestInfo: {
+                        requestId: req.uniqueRequestId,
+                        userRequestId: req.id,
+                        headers: req.headers,
+                        user: req.authInfo?.context?.username || 'system',
+                        scope: req.authInfo?.scope
+                    }
+                });
+                res.status(200).json(result);
+            } catch (err) {
+                const statusCode = err.statusCode || 500;
+                res.status(statusCode).json({
+                    resourceType: 'OperationOutcome',
+                    issue: [{ severity: 'error', code: 'exception', diagnostics: err.message }]
+                });
+            }
+        });
+
+        app.use(pasRouter);
+
+        // DTR operations router (tenant-scoped)
+        const dtrRouter = express.Router({ mergeParams: true });
+        dtrRouter.use(express.json({ type: ['application/json', 'application/fhir+json'] }));
+
+        dtrRouter.post('/tenants/:tenantId/4_0_0/Questionnaire/\\$questionnaire-package', async (req, res) => {
+            try {
+                const result = await container.questionnairePackageOperation.questionnairePackageAsync({
+                    req, tenantId: req.params.tenantId, body: req.body
+                });
+                if (!res.headersSent) {
+                    res.status(200).json(result);
+                }
+            } catch (err) {
+                if (!res.headersSent) {
+                    const statusCode = err.statusCode || 500;
+                    res.status(statusCode).json({
+                        resourceType: 'OperationOutcome',
+                        issue: [{ severity: 'error', code: 'exception', diagnostics: err.message }]
+                    });
+                }
+            }
+        });
+
+        dtrRouter.post('/tenants/:tenantId/4_0_0/Questionnaire/\\$next-question', async (req, res) => {
+            try {
+                const result = await container.nextQuestionOperation.nextQuestionAsync({
+                    req, tenantId: req.params.tenantId, body: req.body
+                });
+                if (!res.headersSent) {
+                    res.status(200).json(result);
+                }
+            } catch (err) {
+                if (!res.headersSent) {
+                    const statusCode = err.statusCode || 500;
+                    res.status(statusCode).json({
+                        resourceType: 'OperationOutcome',
+                        issue: [{ severity: 'error', code: 'exception', diagnostics: err.message }]
+                    });
+                }
+            }
+        });
+
+        app.use(dtrRouter);
+
+        // CDex operations router (tenant-scoped)
+        const cdexRouter = express.Router({ mergeParams: true });
+        cdexRouter.use(express.json({ type: ['application/json', 'application/fhir+json'] }));
+
+        cdexRouter.post('/tenants/:tenantId/4_0_0/\\$submit-attachment', async (req, res) => {
+            try {
+                const result = await container.submitAttachmentOperation.submitAttachmentAsync({
+                    req, tenantId: req.params.tenantId, body: req.body
+                });
+                if (!res.headersSent) {
+                    res.status(200).json(result || { resourceType: 'OperationOutcome', issue: [{ severity: 'information', code: 'informational', diagnostics: 'Attachment submitted successfully' }] });
+                }
+            } catch (err) {
+                if (!res.headersSent) {
+                    const statusCode = err.statusCode || 500;
+                    res.status(statusCode).json({
+                        resourceType: 'OperationOutcome',
+                        issue: [{ severity: 'error', code: 'exception', diagnostics: err.message }]
+                    });
+                }
+            }
+        });
+
+        app.use(cdexRouter);
+
+        // Tenant Admin/Onboarding API router
+        const tenantAdminRouter = container.tenantAdminRouter;
+        app.use('/admin/api/v1', tenantAdminRouter.getRouter());
+
+        logInfo('Da Vinci Burden Reduction routes mounted', {
+            routes: ['CDS Hooks (CRD)', 'PAS $submit/$inquire', 'DTR $questionnaire-package/$next-question', 'CDex $submit-attachment', 'Tenant Admin API']
+        });
+    }
+
     // noinspection JSCheckFunctionSignatures
     passport.use('graphqlStrategy', container.jwt_strategy);
 
