@@ -256,12 +256,18 @@ function createApp({fnGetContainer}) {
         }
     );
 
-    // Correlation ID middleware - extract or generate correlation ID for end-to-end tracing
+    // Correlation ID middleware - extract correlation ID from header for end-to-end tracing.
+    // Only sets the ID if the request already carries one; downstream tenantMiddleware
+    // generates a new ID when none is present, so we avoid double-generation.
     app.use((req, res, next) => {
-        const correlationId = req.headers[CORRELATION_ID_HEADER] || generateUUID();
-        req.correlationId = correlationId;
-        httpContext.set('correlationId', correlationId);
-        res.setHeader('X-Correlation-ID', correlationId);
+        const headerCorrelationId = req.headers[CORRELATION_ID_HEADER];
+        const correlationId = headerCorrelationId || req.correlationId;
+
+        if (correlationId) {
+            req.correlationId = correlationId;
+            httpContext.set('correlationId', correlationId);
+            res.setHeader('X-Correlation-ID', correlationId);
+        }
         next();
     });
 
@@ -394,7 +400,7 @@ function createApp({fnGetContainer}) {
                 const baseUrl = `${req.protocol}://${req.get('host')}`;
                 const config = smartConfigurationEndpoint.buildConfiguration({
                     tenantId: req.params.tenantId,
-                    tenantContext: tenantContext || {},
+                    tenantContext: tenantContext ?? null,
                     baseUrl
                 });
                 res.status(200).json(config);
@@ -406,14 +412,35 @@ function createApp({fnGetContainer}) {
             }
         });
 
+        // Tenant ID mismatch guard: when tenantMiddleware resolves a tenant from JWT,
+        // the URL :tenantId must match, preventing a caller from routing under a
+        // different tenant than their token authorizes.
+        const enforceTenantIdMatch = (req, res, next) => {
+            const urlTenantId = req.params.tenantId;
+            const resolvedTenantId = req.tenantId; // set by tenantMiddleware from JWT/header
+            if (resolvedTenantId && urlTenantId && resolvedTenantId !== urlTenantId) {
+                return res.status(403).json({
+                    resourceType: 'OperationOutcome',
+                    issue: [{
+                        severity: 'error',
+                        code: 'security',
+                        diagnostics: `Tenant ID mismatch: token authorizes '${resolvedTenantId}' but URL targets '${urlTenantId}'`
+                    }]
+                });
+            }
+            next();
+        };
+
         // PAS operations router (tenant-scoped)
         const pasRouter = express.Router({ mergeParams: true });
         pasRouter.use(express.json({ type: ['application/json', 'application/fhir+json'] }));
+        pasRouter.use(enforceTenantIdMatch);
 
         pasRouter.post('/tenants/:tenantId/4_0_0/Claim/\\$submit', async (req, res) => {
             try {
+                const resolvedTenantId = req.tenantId || req.params.tenantId;
                 const result = await container.pasSubmitOperation.submitAsync({
-                    tenantId: req.params.tenantId,
+                    tenantId: resolvedTenantId,
                     requestBundle: req.body,
                     requestInfo: {
                         requestId: req.uniqueRequestId,
@@ -435,8 +462,9 @@ function createApp({fnGetContainer}) {
 
         pasRouter.post('/tenants/:tenantId/4_0_0/Claim/\\$inquire', async (req, res) => {
             try {
+                const resolvedTenantId = req.tenantId || req.params.tenantId;
                 const result = await container.pasInquireOperation.inquireAsync({
-                    tenantId: req.params.tenantId,
+                    tenantId: resolvedTenantId,
                     inquiryBundle: req.body,
                     requestInfo: {
                         requestId: req.uniqueRequestId,
@@ -461,11 +489,13 @@ function createApp({fnGetContainer}) {
         // DTR operations router (tenant-scoped)
         const dtrRouter = express.Router({ mergeParams: true });
         dtrRouter.use(express.json({ type: ['application/json', 'application/fhir+json'] }));
+        dtrRouter.use(enforceTenantIdMatch);
 
         dtrRouter.post('/tenants/:tenantId/4_0_0/Questionnaire/\\$questionnaire-package', async (req, res) => {
             try {
+                const resolvedTenantId = req.tenantId || req.params.tenantId;
                 const result = await container.questionnairePackageOperation.questionnairePackageAsync({
-                    req, tenantId: req.params.tenantId, body: req.body
+                    req, tenantId: resolvedTenantId, body: req.body
                 });
                 if (!res.headersSent) {
                     res.status(200).json(result);
@@ -483,8 +513,9 @@ function createApp({fnGetContainer}) {
 
         dtrRouter.post('/tenants/:tenantId/4_0_0/Questionnaire/\\$next-question', async (req, res) => {
             try {
+                const resolvedTenantId = req.tenantId || req.params.tenantId;
                 const result = await container.nextQuestionOperation.nextQuestionAsync({
-                    req, tenantId: req.params.tenantId, body: req.body
+                    req, tenantId: resolvedTenantId, body: req.body
                 });
                 if (!res.headersSent) {
                     res.status(200).json(result);
@@ -505,11 +536,13 @@ function createApp({fnGetContainer}) {
         // CDex operations router (tenant-scoped)
         const cdexRouter = express.Router({ mergeParams: true });
         cdexRouter.use(express.json({ type: ['application/json', 'application/fhir+json'] }));
+        cdexRouter.use(enforceTenantIdMatch);
 
         cdexRouter.post('/tenants/:tenantId/4_0_0/\\$submit-attachment', async (req, res) => {
             try {
+                const resolvedTenantId = req.tenantId || req.params.tenantId;
                 const result = await container.submitAttachmentOperation.submitAttachmentAsync({
-                    req, tenantId: req.params.tenantId, body: req.body
+                    req, tenantId: resolvedTenantId, body: req.body
                 });
                 if (!res.headersSent) {
                     res.status(200).json(result || { resourceType: 'OperationOutcome', issue: [{ severity: 'information', code: 'informational', diagnostics: 'Attachment submitted successfully' }] });

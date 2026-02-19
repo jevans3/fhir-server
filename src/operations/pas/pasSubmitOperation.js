@@ -28,6 +28,7 @@
  * @see https://hl7.org/fhir/us/davinci-pas/STU2.1/OperationDefinition-Claim-submit.html
  */
 
+const axios = require('axios');
 const { assertTypeEquals, assertIsValid } = require('../../utils/assertType');
 const { TenantDatabaseManager } = require('../../multiTenancy/tenantDatabaseManager');
 const { CorrelationIdManager, WORKFLOW_STAGES } = require('../../tracing/correlationIdManager');
@@ -418,13 +419,14 @@ class PasSubmitOperation {
             throw new Error('PAS 15-second SLA exceeded before payer routing could begin');
         }
 
-        // Create a timeout-guarded promise
+        // Create a timeout-guarded promise with proper timer cleanup
         const routingPromise = payerRoutingConfig.requiresX12
             ? this._routeViaX12Async({ payerRoutingConfig, requestBundle, platformTrackingId, tracingContext })
             : this._routeViaFhirNativeAsync({ payerRoutingConfig, requestBundle, platformTrackingId, tracingContext });
 
+        let slaTimer;
         const timeoutPromise = new Promise((_, reject) => {
-            setTimeout(() => {
+            slaTimer = setTimeout(() => {
                 reject(new Error(
                     `PAS 15-second response SLA exceeded (${PAS_RESPONSE_SLA_MS}ms). ` +
                     'Payer did not respond in time. The request may still be processing; ' +
@@ -433,7 +435,11 @@ class PasSubmitOperation {
             }, remainingTimeMs);
         });
 
-        return Promise.race([routingPromise, timeoutPromise]);
+        try {
+            return await Promise.race([routingPromise, timeoutPromise]);
+        } finally {
+            clearTimeout(slaTimer);
+        }
     }
 
     /**
@@ -457,35 +463,93 @@ class PasSubmitOperation {
             payerEndpoint: payerRoutingConfig.payerEndpoint
         });
 
-        const propagationHeaders = this.correlationIdManager.buildPropagationHeaders(tracingContext);
-
         if (!payerRoutingConfig.payerEndpoint) {
-            // If no endpoint configured, return a pended response
-            // (the payer will be notified via subscription or async channel)
+            // No endpoint configured - return a pended response;
+            // the payer will be notified via subscription or async channel
             return this._buildPendedResponseBundle(platformTrackingId, requestBundle);
         }
 
-        // In a production system, this would make an HTTP call to the payer's $submit endpoint.
-        // For now, we provide the integration point signature.
-        // The actual HTTP call would use: POST {payerEndpoint}/Claim/$submit
         const payerUrl = `${payerRoutingConfig.payerEndpoint}/Claim/$submit`;
+        const propagationHeaders = this.correlationIdManager.buildPropagationHeaders(tracingContext);
+
+        const headers = {
+            ...propagationHeaders,
+            'Content-Type': 'application/fhir+json',
+            Accept: 'application/fhir+json',
+            'X-Platform-Tracking-Id': platformTrackingId
+        };
+
+        // Add authorization from the payer connection config if available
+        if (payerRoutingConfig.connectionConfig) {
+            const conn = payerRoutingConfig.connectionConfig;
+            if (conn.authType === 'bearer' && conn.authToken) {
+                headers.Authorization = `Bearer ${conn.authToken}`;
+            } else if (conn.authType === 'basic' && conn.authToken) {
+                headers.Authorization = `Basic ${conn.authToken}`;
+            }
+        }
 
         logInfo('Forwarding PAS request to payer', {
             platformTrackingId,
             payerUrl,
-            headers: Object.keys(propagationHeaders)
+            headers: Object.keys(headers)
         });
 
-        // Placeholder: In production, replace with actual HTTP client call
-        // const response = await httpClient.post(payerUrl, requestBundle, { headers: propagationHeaders });
-        // return response.data;
+        try {
+            const response = await axios({
+                method: 'POST',
+                url: payerUrl,
+                data: requestBundle,
+                headers,
+                timeout: PAS_RESPONSE_SLA_MS,
+                validateStatus: () => true
+            });
 
-        // Return a pended response as default when no real payer integration is active
-        return this._buildPendedResponseBundle(platformTrackingId, requestBundle);
+            if (response.status >= 200 && response.status < 300 && response.data) {
+                logInfo('Payer FHIR $submit response received', {
+                    platformTrackingId,
+                    statusCode: response.status
+                });
+                return response.data;
+            }
+
+            logError('Payer FHIR $submit returned non-success status', {
+                platformTrackingId,
+                statusCode: response.status,
+                responseData: typeof response.data === 'object' ? JSON.stringify(response.data).substring(0, 500) : undefined
+            });
+
+            // If the payer returned a FHIR OperationOutcome or error bundle, propagate it
+            if (response.data && response.data.resourceType) {
+                return response.data;
+            }
+
+            throw new Error(`Payer $submit returned HTTP ${response.status}`);
+        } catch (error) {
+            if (error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT') {
+                logError('Payer FHIR $submit timed out', { platformTrackingId, payerUrl });
+                throw new Error(
+                    `Payer $submit endpoint did not respond within ${PAS_RESPONSE_SLA_MS}ms. ` +
+                    'The request may still be processing; use $inquire to check status.'
+                );
+            }
+            if (error.code === 'ECONNREFUSED' || error.code === 'ENOTFOUND') {
+                logError('Payer FHIR $submit connection failed', {
+                    platformTrackingId,
+                    payerUrl,
+                    errorCode: error.code
+                });
+                throw new Error(`Unable to connect to payer endpoint: ${error.code}`);
+            }
+            throw error;
+        }
     }
 
     /**
-     * Routes the request via X12 278 translation to the payer
+     * Routes the request via X12 278 translation to the payer.
+     *
+     * Flow: FHIR Bundle -> X12 278 -> payer endpoint -> X12 278 response -> FHIR Bundle
+     *
      * @param {Object} params
      * @param {Object} params.payerRoutingConfig
      * @param {Object} params.requestBundle
@@ -512,29 +576,118 @@ class PasSubmitOperation {
         }
 
         // Step 1: Translate FHIR Bundle to X12 278 request
-        const x12Request = this.x12TranslationAdapter.fhirToX12_278(requestBundle, {
+        const translationResult = await this.x12TranslationAdapter.fhirToX12_278(requestBundle, {
             platformTrackingId,
             payerIdentifier: payerRoutingConfig.payerIdentifier,
             connectionConfig: payerRoutingConfig.connectionConfig
         });
 
+        const x12RequestData = translationResult.x12Data || translationResult;
+
         logInfo('FHIR to X12 278 translation completed', {
             platformTrackingId,
-            x12SegmentCount: x12Request ? x12Request.split('~').length : 0
+            segmentCount: translationResult.metadata?.segmentCount,
+            controlNumber: translationResult.metadata?.controlNumber,
+            warnings: translationResult.metadata?.warnings?.length || 0
         });
 
-        // Step 2: Send X12 to payer endpoint
-        // In production, this would send via AS2, SFTP, or real-time HTTP to a clearinghouse
-        // const x12Response = await x12Client.send(payerRoutingConfig.payerEndpoint, x12Request);
+        // Step 2: Send X12 278 request to payer endpoint via HTTP POST
+        if (!payerRoutingConfig.payerEndpoint) {
+            logInfo('No X12 payer endpoint configured, returning pended response', { platformTrackingId });
+            return this._buildPendedResponseBundle(platformTrackingId, requestBundle);
+        }
 
-        // Step 3: Translate X12 278 response back to FHIR
-        // const responseBundle = this.x12TranslationAdapter.x12_278ToFhir(x12Response, { platformTrackingId });
+        const propagationHeaders = this.correlationIdManager.buildPropagationHeaders(tracingContext);
+        const headers = {
+            ...propagationHeaders,
+            'Content-Type': 'application/edi-x12',
+            Accept: 'application/edi-x12',
+            'X-Platform-Tracking-Id': platformTrackingId
+        };
 
-        // Step 4: Create Provenance documenting the translation
-        // const provenance = this.x12TranslationAdapter.createProvenance(requestBundle, responseBundle);
+        if (payerRoutingConfig.connectionConfig) {
+            const conn = payerRoutingConfig.connectionConfig;
+            if (conn.authType === 'bearer' && conn.authToken) {
+                headers.Authorization = `Bearer ${conn.authToken}`;
+            }
+        }
 
-        // For now, return pended response as placeholder
-        return this._buildPendedResponseBundle(platformTrackingId, requestBundle);
+        let x12ResponseData;
+        try {
+            const response = await axios({
+                method: 'POST',
+                url: payerRoutingConfig.payerEndpoint,
+                data: x12RequestData,
+                headers,
+                timeout: PAS_RESPONSE_SLA_MS,
+                // Treat response as text since X12 is plain text EDI
+                responseType: 'text',
+                transformResponse: [data => data],
+                validateStatus: () => true
+            });
+
+            if (response.status < 200 || response.status >= 300) {
+                logError('Payer X12 endpoint returned non-success status', {
+                    platformTrackingId,
+                    statusCode: response.status
+                });
+                throw new Error(`Payer X12 endpoint returned HTTP ${response.status}`);
+            }
+
+            x12ResponseData = response.data;
+        } catch (error) {
+            if (error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT') {
+                logError('Payer X12 endpoint timed out', { platformTrackingId });
+                throw new Error(
+                    `Payer X12 endpoint did not respond within ${PAS_RESPONSE_SLA_MS}ms. ` +
+                    'Use $inquire to check status.'
+                );
+            }
+            if (error.code === 'ECONNREFUSED' || error.code === 'ENOTFOUND') {
+                throw new Error(`Unable to connect to payer X12 endpoint: ${error.code}`);
+            }
+            throw error;
+        }
+
+        logInfo('X12 278 response received from payer', {
+            platformTrackingId,
+            responseLength: x12ResponseData ? x12ResponseData.length : 0
+        });
+
+        // Step 3: Translate X12 278 response back to FHIR Bundle
+        const reverseResult = await this.x12TranslationAdapter.x12_278ToFhir(x12ResponseData, {
+            platformTrackingId
+        });
+
+        const responseBundle = reverseResult.bundle || reverseResult;
+
+        if (reverseResult.metadata?.unmappedSegments?.length > 0) {
+            logInfo('X12-to-FHIR translation had unmapped segments', {
+                platformTrackingId,
+                unmappedCount: reverseResult.metadata.unmappedSegments.length
+            });
+        }
+
+        // Step 4: Create Provenance documenting the round-trip translation
+        const provenance = this.x12TranslationAdapter.createProvenance(requestBundle, responseBundle, {
+            translationDirection: 'round-trip',
+            transactionSet: '278',
+            platformTrackingId,
+            warnings: [
+                ...(translationResult.metadata?.warnings || []),
+                ...(reverseResult.metadata?.warnings || [])
+            ]
+        });
+
+        // Inject Provenance into the response bundle
+        if (responseBundle.entry && provenance) {
+            responseBundle.entry.push({
+                fullUrl: `urn:uuid:${provenance.id || generateUUID()}`,
+                resource: provenance
+            });
+        }
+
+        return responseBundle;
     }
 
     /**

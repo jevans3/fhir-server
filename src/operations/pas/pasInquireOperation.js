@@ -21,6 +21,7 @@
  * @see https://hl7.org/fhir/us/davinci-pas/STU2.1/OperationDefinition-Claim-inquire.html
  */
 
+const axios = require('axios');
 const { assertTypeEquals, assertIsValid } = require('../../utils/assertType');
 const { TenantDatabaseManager } = require('../../multiTenancy/tenantDatabaseManager');
 const { CorrelationIdManager, WORKFLOW_STAGES } = require('../../tracing/correlationIdManager');
@@ -363,8 +364,9 @@ class PasInquireOperation {
             ? this._routeInquiryViaX12Async({ payerRoutingConfig, inquiryBundle, tracingContext })
             : this._routeInquiryViaFhirNativeAsync({ payerRoutingConfig, inquiryBundle, originalRequest, tracingContext });
 
+        let slaTimer;
         const timeoutPromise = new Promise((_, reject) => {
-            setTimeout(() => {
+            slaTimer = setTimeout(() => {
                 reject(new Error(
                     `PAS 15-second response SLA exceeded (${PAS_INQUIRE_SLA_MS}ms). ` +
                     'Payer did not respond to inquiry in time.'
@@ -372,7 +374,11 @@ class PasInquireOperation {
             }, remainingTimeMs);
         });
 
-        return Promise.race([routingPromise, timeoutPromise]);
+        try {
+            return await Promise.race([routingPromise, timeoutPromise]);
+        } finally {
+            clearTimeout(slaTimer);
+        }
     }
 
     /**
@@ -395,18 +401,65 @@ class PasInquireOperation {
             payerEndpoint: payerRoutingConfig.payerEndpoint
         });
 
-        const propagationHeaders = this.correlationIdManager.buildPropagationHeaders(tracingContext);
-
         if (payerRoutingConfig.payerEndpoint) {
-            // In production, this would make an HTTP call to the payer's $inquire endpoint:
-            // POST {payerEndpoint}/Claim/$inquire
             const payerUrl = `${payerRoutingConfig.payerEndpoint}/Claim/$inquire`;
+            const propagationHeaders = this.correlationIdManager.buildPropagationHeaders(tracingContext);
+
+            const headers = {
+                ...propagationHeaders,
+                'Content-Type': 'application/fhir+json',
+                Accept: 'application/fhir+json'
+            };
+
+            if (payerRoutingConfig.connectionConfig) {
+                const conn = payerRoutingConfig.connectionConfig;
+                if (conn.authType === 'bearer' && conn.authToken) {
+                    headers.Authorization = `Bearer ${conn.authToken}`;
+                } else if (conn.authType === 'basic' && conn.authToken) {
+                    headers.Authorization = `Basic ${conn.authToken}`;
+                }
+            }
+
             logInfo('Forwarding PAS inquiry to payer', {
                 payerUrl,
-                headers: Object.keys(propagationHeaders)
+                headers: Object.keys(headers)
             });
-            // const response = await httpClient.post(payerUrl, inquiryBundle, { headers: propagationHeaders });
-            // return response.data;
+
+            try {
+                const response = await axios({
+                    method: 'POST',
+                    url: payerUrl,
+                    data: inquiryBundle,
+                    headers,
+                    timeout: PAS_INQUIRE_SLA_MS,
+                    validateStatus: () => true
+                });
+
+                if (response.status >= 200 && response.status < 300 && response.data) {
+                    logInfo('Payer FHIR $inquire response received', {
+                        statusCode: response.status
+                    });
+                    return response.data;
+                }
+
+                logError('Payer FHIR $inquire returned non-success status', {
+                    statusCode: response.status
+                });
+
+                if (response.data && response.data.resourceType) {
+                    return response.data;
+                }
+            } catch (error) {
+                if (error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT') {
+                    throw new Error(
+                        `Payer $inquire endpoint did not respond within ${PAS_INQUIRE_SLA_MS}ms`
+                    );
+                }
+                if (error.code === 'ECONNREFUSED' || error.code === 'ENOTFOUND') {
+                    throw new Error(`Unable to connect to payer inquiry endpoint: ${error.code}`);
+                }
+                throw error;
+            }
         }
 
         // If we have a stored response from the original request, return it
@@ -419,7 +472,10 @@ class PasInquireOperation {
     }
 
     /**
-     * Routes inquiry via X12 278 to the payer
+     * Routes inquiry via X12 278 to the payer.
+     *
+     * Flow: FHIR Inquiry Bundle -> X12 278 -> payer endpoint -> X12 278 response -> FHIR Bundle
+     *
      * @param {Object} params
      * @param {Object} params.payerRoutingConfig
      * @param {Object} params.inquiryBundle
@@ -442,12 +498,72 @@ class PasInquireOperation {
             );
         }
 
-        // In production, translate to X12, send, and translate response back:
-        // const x12Request = this.x12TranslationAdapter.fhirToX12_278(inquiryBundle, { ... });
-        // const x12Response = await x12Client.send(payerRoutingConfig.payerEndpoint, x12Request);
-        // return this.x12TranslationAdapter.x12_278ToFhir(x12Response, { ... });
+        // Step 1: Translate FHIR Inquiry Bundle to X12 278
+        const translationResult = await this.x12TranslationAdapter.fhirToX12_278(inquiryBundle, {
+            transactionSetPurpose: 'HI', // Health Care Services Review - Inquiry
+            payerIdentifier: payerRoutingConfig.payerIdentifier,
+            connectionConfig: payerRoutingConfig.connectionConfig
+        });
 
-        return this._buildInquiryResponseBundle(inquiryBundle, null);
+        const x12RequestData = translationResult.x12Data || translationResult;
+
+        logInfo('FHIR inquiry to X12 278 translation completed', {
+            segmentCount: translationResult.metadata?.segmentCount
+        });
+
+        // Step 2: Send to payer endpoint
+        if (!payerRoutingConfig.payerEndpoint) {
+            return this._buildInquiryResponseBundle(inquiryBundle, null);
+        }
+
+        const propagationHeaders = this.correlationIdManager.buildPropagationHeaders(tracingContext);
+        const headers = {
+            ...propagationHeaders,
+            'Content-Type': 'application/edi-x12',
+            Accept: 'application/edi-x12'
+        };
+
+        if (payerRoutingConfig.connectionConfig) {
+            const conn = payerRoutingConfig.connectionConfig;
+            if (conn.authType === 'bearer' && conn.authToken) {
+                headers.Authorization = `Bearer ${conn.authToken}`;
+            }
+        }
+
+        let x12ResponseData;
+        try {
+            const response = await axios({
+                method: 'POST',
+                url: payerRoutingConfig.payerEndpoint,
+                data: x12RequestData,
+                headers,
+                timeout: PAS_INQUIRE_SLA_MS,
+                responseType: 'text',
+                transformResponse: [data => data],
+                validateStatus: () => true
+            });
+
+            if (response.status < 200 || response.status >= 300) {
+                throw new Error(`Payer X12 inquiry endpoint returned HTTP ${response.status}`);
+            }
+
+            x12ResponseData = response.data;
+        } catch (error) {
+            if (error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT') {
+                throw new Error(
+                    `Payer X12 inquiry endpoint did not respond within ${PAS_INQUIRE_SLA_MS}ms`
+                );
+            }
+            if (error.code === 'ECONNREFUSED' || error.code === 'ENOTFOUND') {
+                throw new Error(`Unable to connect to payer X12 inquiry endpoint: ${error.code}`);
+            }
+            throw error;
+        }
+
+        // Step 3: Translate X12 278 response back to FHIR
+        const reverseResult = await this.x12TranslationAdapter.x12_278ToFhir(x12ResponseData, {});
+
+        return reverseResult.bundle || reverseResult;
     }
 
     /**

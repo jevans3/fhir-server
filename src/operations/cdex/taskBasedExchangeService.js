@@ -458,8 +458,10 @@ class TaskBasedExchangeService {
             return { valid: false, errors };
         }
 
-        // Check profile declaration
-        const hasProfile = task.meta?.profile?.includes(CDEX_TASK_DATA_REQUEST_PROFILE);
+        // Check profile declaration using strict exact-match comparison.
+        // We explicitly use === to prevent any substring matching concerns.
+        const profiles = Array.isArray(task.meta?.profile) ? task.meta.profile : [];
+        const hasProfile = profiles.some(p => typeof p === 'string' && p === CDEX_TASK_DATA_REQUEST_PROFILE);
         if (!hasProfile) {
             errors.push(
                 `Task.meta.profile must include "${CDEX_TASK_DATA_REQUEST_PROFILE}"`

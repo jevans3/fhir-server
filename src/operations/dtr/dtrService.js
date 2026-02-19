@@ -6,6 +6,7 @@
  *
  * @see https://build.fhir.org/ig/HL7/davinci-dtr/
  */
+const crypto = require('crypto');
 const { assertTypeEquals, assertIsValid } = require('../../utils/assertType');
 const { TenantService } = require('../../multiTenancy/tenantService');
 const { CorrelationIdManager, WORKFLOW_STAGES } = require('../../tracing/correlationIdManager');
@@ -275,7 +276,7 @@ class DtrService {
             oldestKeys.forEach(k => this.activeSessions.delete(k));
         }
 
-        const sessionId = `dtr-${tenantId}-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
+        const sessionId = `dtr-${tenantId}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
         const now = new Date().toISOString();
 
         this.activeSessions.set(sessionId, {
