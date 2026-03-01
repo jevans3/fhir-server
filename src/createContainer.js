@@ -3,6 +3,46 @@
 const {SimpleContainer} = require('./utils/simpleContainer');
 const {AccessLogger} = require('./utils/accessLogger');
 const {ChangeEventProducer} = require('./utils/changeEventProducer');
+
+// Multi-Tenancy imports
+const {TenantService} = require('./multiTenancy/tenantService');
+const {TenantDatabaseManager} = require('./multiTenancy/tenantDatabaseManager');
+const {TenantConfigManager} = require('./multiTenancy/tenantConfigManager');
+const {CorrelationIdManager} = require('./tracing/correlationIdManager');
+
+// Da Vinci CDS Hooks / CRD imports
+const {CdsHooksRouter} = require('./cdsHooks/cdsHooksRouter');
+const {CdsHooksService} = require('./cdsHooks/cdsHooksService');
+const {HookDispatcher} = require('./cdsHooks/hookDispatcher');
+const {CardGenerator} = require('./cdsHooks/cardGenerator');
+
+// Da Vinci DTR imports
+const {QuestionnairePackageOperation} = require('./operations/dtr/questionnairePackageOperation');
+const {NextQuestionOperation} = require('./operations/dtr/nextQuestionOperation');
+const {DtrService} = require('./operations/dtr/dtrService');
+
+// Da Vinci PAS imports
+const {PasSubmitOperation} = require('./operations/pas/pasSubmitOperation');
+const {PasInquireOperation} = require('./operations/pas/pasInquireOperation');
+const {PasBundleValidator} = require('./operations/pas/pasBundleValidator');
+
+// Da Vinci CDex imports
+const {SubmitAttachmentOperation} = require('./operations/cdex/submitAttachmentOperation');
+const {TaskBasedExchangeService} = require('./operations/cdex/taskBasedExchangeService');
+
+// X12 Translation imports
+const {BuiltInX12Adapter} = require('./x12/builtInX12Adapter');
+
+// Enhanced Audit imports
+const {EnhancedAuditLogger} = require('./audit/enhancedAuditLogger');
+
+// SMART on FHIR imports
+const {SmartConfigurationEndpoint} = require('./smartOnFhir/smartConfigurationEndpoint');
+const {BackendServicesAuth} = require('./smartOnFhir/backendServicesAuth');
+
+// Tenant Admin imports
+const {TenantAdminRouter} = require('./admin/tenantAdminRouter');
+const {TenantProvisioningService} = require('./admin/tenantProvisioningService');
 const {ResourceManager} = require('./operations/common/resourceManager');
 const {DatabaseBulkInserter} = require('./dataLayer/databaseBulkInserter');
 const {DatabaseBulkLoader} = require('./dataLayer/databaseBulkLoader');
@@ -1018,6 +1058,127 @@ const createContainer = function () {
     }));
     container.register('redisManager', (c) => new RedisManager({
         redisClient: c.redisClient
+    }));
+
+    // Multi-Tenancy services
+    container.register('tenantService', (c) => new TenantService({
+        mongoDatabaseManager: c.mongoDatabaseManager
+    }));
+
+    container.register('tenantDatabaseManager', (c) => new TenantDatabaseManager({
+        configManager: c.configManager
+    }));
+
+    container.register('tenantConfigManager', (c) => new TenantConfigManager({
+        configManager: c.configManager
+    }));
+
+    // Tracing / Correlation ID manager
+    container.register('correlationIdManager', () => new CorrelationIdManager());
+
+    // --- Da Vinci Burden Reduction services ---
+
+    // X12 Translation Adapter (plugin architecture - built-in adapter)
+    container.register('x12TranslationAdapter', () => new BuiltInX12Adapter());
+
+    // PAS Bundle Validator
+    container.register('pasBundleValidator', () => new PasBundleValidator());
+
+    // PAS $submit Operation
+    container.register('pasSubmitOperation', (c) => new PasSubmitOperation({
+        tenantDatabaseManager: c.tenantDatabaseManager,
+        correlationIdManager: c.correlationIdManager,
+        tenantService: c.tenantService,
+        pasBundleValidator: c.pasBundleValidator,
+        x12TranslationAdapter: c.x12TranslationAdapter
+    }));
+
+    // PAS $inquire Operation
+    container.register('pasInquireOperation', (c) => new PasInquireOperation({
+        tenantDatabaseManager: c.tenantDatabaseManager,
+        correlationIdManager: c.correlationIdManager,
+        tenantService: c.tenantService,
+        pasBundleValidator: c.pasBundleValidator,
+        x12TranslationAdapter: c.x12TranslationAdapter
+    }));
+
+    // DTR Service
+    container.register('dtrService', (c) => new DtrService({
+        tenantService: c.tenantService,
+        correlationIdManager: c.correlationIdManager
+    }));
+
+    // DTR $questionnaire-package Operation
+    container.register('questionnairePackageOperation', (c) => new QuestionnairePackageOperation({
+        tenantService: c.tenantService,
+        correlationIdManager: c.correlationIdManager,
+        dtrService: c.dtrService
+    }));
+
+    // DTR $next-question Operation
+    container.register('nextQuestionOperation', (c) => new NextQuestionOperation({
+        tenantService: c.tenantService,
+        correlationIdManager: c.correlationIdManager,
+        dtrService: c.dtrService
+    }));
+
+    // CDex $submit-attachment Operation
+    container.register('submitAttachmentOperation', (c) => new SubmitAttachmentOperation({
+        tenantService: c.tenantService,
+        correlationIdManager: c.correlationIdManager
+    }));
+
+    // CDex Task-based Exchange Service
+    container.register('taskBasedExchangeService', (c) => new TaskBasedExchangeService({
+        tenantService: c.tenantService,
+        correlationIdManager: c.correlationIdManager
+    }));
+
+    // CDS Hooks / CRD Engine
+    container.register('cardGenerator', () => new CardGenerator());
+
+    container.register('hookDispatcher', (c) => new HookDispatcher({
+        correlationIdManager: c.correlationIdManager,
+        tenantConfigManager: c.tenantConfigManager
+    }));
+
+    container.register('cdsHooksService', (c) => new CdsHooksService({
+        hookDispatcher: c.hookDispatcher,
+        cardGenerator: c.cardGenerator,
+        correlationIdManager: c.correlationIdManager,
+        auditLogger: c.auditLogger
+    }));
+
+    container.register('cdsHooksRouter', (c) => new CdsHooksRouter({
+        cdsHooksService: c.cdsHooksService,
+        tenantConfigManager: c.tenantConfigManager
+    }));
+
+    // Enhanced Audit Logger (CMS-0057-F compliant)
+    container.register('enhancedAuditLogger', (c) => new EnhancedAuditLogger({
+        postRequestProcessor: c.postRequestProcessor,
+        configManager: c.configManager,
+        correlationIdManager: c.correlationIdManager
+    }));
+
+    // SMART on FHIR
+    container.register('smartConfigurationEndpoint', (c) => new SmartConfigurationEndpoint({
+        tenantConfigManager: c.tenantConfigManager
+    }));
+
+    container.register('backendServicesAuth', (c) => new BackendServicesAuth({
+        tenantService: c.tenantService
+    }));
+
+    // Tenant Administration & Onboarding
+    container.register('tenantProvisioningService', (c) => new TenantProvisioningService({
+        tenantDatabaseManager: c.tenantDatabaseManager,
+        configManager: c.configManager
+    }));
+
+    container.register('tenantAdminRouter', (c) => new TenantAdminRouter({
+        tenantService: c.tenantService,
+        tenantDatabaseManager: c.tenantDatabaseManager
     }));
 
     return container;

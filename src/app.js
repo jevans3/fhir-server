@@ -36,6 +36,7 @@ const {handleServerError} = require('./routeHandlers/handleError');
 const {shouldReturnHtml} = require('./utils/requestHelpers.js');
 const {generateLogDetail} = require('./utils/requestCompletionLogData.js');
 const {incrementRequestCount, decrementRequestCount, getRequestCount} = require('./utils/requestCounter');
+const {createOptionalTenantMiddleware, CORRELATION_ID_HEADER} = require('./multiTenancy/tenantMiddleware');
 
 /**
  * Creates the FHIR app
@@ -255,6 +256,27 @@ function createApp({fnGetContainer}) {
         }
     );
 
+    // Correlation ID middleware - extract correlation ID from header for end-to-end tracing.
+    // Only sets the ID if the request already carries one; downstream tenantMiddleware
+    // generates a new ID when none is present, so we avoid double-generation.
+    app.use((req, res, next) => {
+        const headerCorrelationId = req.headers[CORRELATION_ID_HEADER];
+        const correlationId = headerCorrelationId || req.correlationId;
+
+        if (correlationId) {
+            req.correlationId = correlationId;
+            httpContext.set('correlationId', correlationId);
+            res.setHeader('X-Correlation-ID', correlationId);
+        }
+        next();
+    });
+
+    // Multi-tenancy middleware (optional context - routes that need it will enforce)
+    if (isTrue(process.env.ENABLE_MULTI_TENANCY)) {
+        const tenantService = container.tenantService;
+        app.use(createOptionalTenantMiddleware({ tenantService }));
+    }
+
     // generate nonce, and add to httpContext
     app.use((req, res, next) => {
         const nonce = generateNonce();
@@ -362,6 +384,190 @@ function createApp({fnGetContainer}) {
         (req, res) => handleAdminPut(fnGetContainer, req, res));
 
     app.use(adminRouter);
+
+    // --- Da Vinci Burden Reduction Routes (CDS Hooks, PAS, DTR, CDex) ---
+    // Only mounted when multi-tenancy is enabled
+    if (isTrue(process.env.ENABLE_MULTI_TENANCY)) {
+        // CDS Hooks 2.0 / CRD routes (discovery + hook invocation)
+        const cdsHooksRouter = container.cdsHooksRouter;
+        app.use(cdsHooksRouter.getRouter());
+
+        // Per-tenant SMART on FHIR configuration endpoint
+        const smartConfigurationEndpoint = container.smartConfigurationEndpoint;
+        app.get('/tenants/:tenantId/.well-known/smart-configuration', (req, res) => {
+            try {
+                const tenantContext = req.tenantContext;
+                const baseUrl = `${req.protocol}://${req.get('host')}`;
+                const config = smartConfigurationEndpoint.buildConfiguration({
+                    tenantId: req.params.tenantId,
+                    tenantContext: tenantContext ?? null,
+                    baseUrl
+                });
+                res.status(200).json(config);
+            } catch (err) {
+                res.status(500).json({
+                    resourceType: 'OperationOutcome',
+                    issue: [{ severity: 'error', code: 'exception', diagnostics: err.message }]
+                });
+            }
+        });
+
+        // Tenant ID mismatch guard: when tenantMiddleware resolves a tenant from JWT,
+        // the URL :tenantId must match, preventing a caller from routing under a
+        // different tenant than their token authorizes.
+        const enforceTenantIdMatch = (req, res, next) => {
+            const urlTenantId = req.params.tenantId;
+            const resolvedTenantId = req.tenantId; // set by tenantMiddleware from JWT/header
+            if (resolvedTenantId && urlTenantId && resolvedTenantId !== urlTenantId) {
+                return res.status(403).json({
+                    resourceType: 'OperationOutcome',
+                    issue: [{
+                        severity: 'error',
+                        code: 'security',
+                        diagnostics: `Tenant ID mismatch: token authorizes '${resolvedTenantId}' but URL targets '${urlTenantId}'`
+                    }]
+                });
+            }
+            next();
+        };
+
+        // PAS operations router (tenant-scoped)
+        const pasRouter = express.Router({ mergeParams: true });
+        pasRouter.use(express.json({ type: ['application/json', 'application/fhir+json'] }));
+        pasRouter.use(enforceTenantIdMatch);
+
+        pasRouter.post('/tenants/:tenantId/4_0_0/Claim/\\$submit', async (req, res) => {
+            try {
+                const resolvedTenantId = req.tenantId || req.params.tenantId;
+                const result = await container.pasSubmitOperation.submitAsync({
+                    tenantId: resolvedTenantId,
+                    requestBundle: req.body,
+                    requestInfo: {
+                        requestId: req.uniqueRequestId,
+                        userRequestId: req.id,
+                        headers: req.headers,
+                        user: req.authInfo?.context?.username || 'system',
+                        scope: req.authInfo?.scope
+                    }
+                });
+                res.status(200).json(result);
+            } catch (err) {
+                const statusCode = err.statusCode || 500;
+                res.status(statusCode).json({
+                    resourceType: 'OperationOutcome',
+                    issue: [{ severity: 'error', code: 'exception', diagnostics: err.message }]
+                });
+            }
+        });
+
+        pasRouter.post('/tenants/:tenantId/4_0_0/Claim/\\$inquire', async (req, res) => {
+            try {
+                const resolvedTenantId = req.tenantId || req.params.tenantId;
+                const result = await container.pasInquireOperation.inquireAsync({
+                    tenantId: resolvedTenantId,
+                    inquiryBundle: req.body,
+                    requestInfo: {
+                        requestId: req.uniqueRequestId,
+                        userRequestId: req.id,
+                        headers: req.headers,
+                        user: req.authInfo?.context?.username || 'system',
+                        scope: req.authInfo?.scope
+                    }
+                });
+                res.status(200).json(result);
+            } catch (err) {
+                const statusCode = err.statusCode || 500;
+                res.status(statusCode).json({
+                    resourceType: 'OperationOutcome',
+                    issue: [{ severity: 'error', code: 'exception', diagnostics: err.message }]
+                });
+            }
+        });
+
+        app.use(pasRouter);
+
+        // DTR operations router (tenant-scoped)
+        const dtrRouter = express.Router({ mergeParams: true });
+        dtrRouter.use(express.json({ type: ['application/json', 'application/fhir+json'] }));
+        dtrRouter.use(enforceTenantIdMatch);
+
+        dtrRouter.post('/tenants/:tenantId/4_0_0/Questionnaire/\\$questionnaire-package', async (req, res) => {
+            try {
+                const resolvedTenantId = req.tenantId || req.params.tenantId;
+                const result = await container.questionnairePackageOperation.questionnairePackageAsync({
+                    req, tenantId: resolvedTenantId, body: req.body
+                });
+                if (!res.headersSent) {
+                    res.status(200).json(result);
+                }
+            } catch (err) {
+                if (!res.headersSent) {
+                    const statusCode = err.statusCode || 500;
+                    res.status(statusCode).json({
+                        resourceType: 'OperationOutcome',
+                        issue: [{ severity: 'error', code: 'exception', diagnostics: err.message }]
+                    });
+                }
+            }
+        });
+
+        dtrRouter.post('/tenants/:tenantId/4_0_0/Questionnaire/\\$next-question', async (req, res) => {
+            try {
+                const resolvedTenantId = req.tenantId || req.params.tenantId;
+                const result = await container.nextQuestionOperation.nextQuestionAsync({
+                    req, tenantId: resolvedTenantId, body: req.body
+                });
+                if (!res.headersSent) {
+                    res.status(200).json(result);
+                }
+            } catch (err) {
+                if (!res.headersSent) {
+                    const statusCode = err.statusCode || 500;
+                    res.status(statusCode).json({
+                        resourceType: 'OperationOutcome',
+                        issue: [{ severity: 'error', code: 'exception', diagnostics: err.message }]
+                    });
+                }
+            }
+        });
+
+        app.use(dtrRouter);
+
+        // CDex operations router (tenant-scoped)
+        const cdexRouter = express.Router({ mergeParams: true });
+        cdexRouter.use(express.json({ type: ['application/json', 'application/fhir+json'] }));
+        cdexRouter.use(enforceTenantIdMatch);
+
+        cdexRouter.post('/tenants/:tenantId/4_0_0/\\$submit-attachment', async (req, res) => {
+            try {
+                const resolvedTenantId = req.tenantId || req.params.tenantId;
+                const result = await container.submitAttachmentOperation.submitAttachmentAsync({
+                    req, tenantId: resolvedTenantId, body: req.body
+                });
+                if (!res.headersSent) {
+                    res.status(200).json(result || { resourceType: 'OperationOutcome', issue: [{ severity: 'information', code: 'informational', diagnostics: 'Attachment submitted successfully' }] });
+                }
+            } catch (err) {
+                if (!res.headersSent) {
+                    const statusCode = err.statusCode || 500;
+                    res.status(statusCode).json({
+                        resourceType: 'OperationOutcome',
+                        issue: [{ severity: 'error', code: 'exception', diagnostics: err.message }]
+                    });
+                }
+            }
+        });
+
+        app.use(cdexRouter);
+
+        // Tenant Admin/Onboarding API router
+        const tenantAdminRouter = container.tenantAdminRouter;
+        app.use('/admin/api/v1', tenantAdminRouter.getRouter());
+
+        logInfo('Da Vinci Burden Reduction routes mounted', {
+            routes: ['CDS Hooks (CRD)', 'PAS $submit/$inquire', 'DTR $questionnaire-package/$next-question', 'CDex $submit-attachment', 'Tenant Admin API']
+        });
+    }
 
     // noinspection JSCheckFunctionSignatures
     passport.use('graphqlStrategy', container.jwt_strategy);
